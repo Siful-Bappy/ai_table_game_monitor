@@ -1,0 +1,12 @@
+# Ultralytics YOLO 🚀, AGPL-3.0 license
+# usage: yolo train data=yolo_hand.yaml
+# dataset directory strcture:
+# dataset_base_dir/images/{train/val/test}/fname.jpg
+#                  labels/{train/val/test}/fname.txt 
+path: ./gkl1 # dataset base dir
+#path: ./dataset_hand # dataset base dir
+train: images/train # train images (relative to 'path') 
+val: images/val # val images (relative to 'path')
+# Classes
+names:
+  0: hand 

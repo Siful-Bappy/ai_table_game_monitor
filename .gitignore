@@ -227,6 +227,8 @@ dataset_bee_cards/
 # addition folder dont need to upload
 # additionals/
 working/
+save_cards/
+save_cards/1777283923/
 
 # Generated / augmented dataset output folders
 dataset_gkl_cards/augmented*/

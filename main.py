@@ -430,7 +430,8 @@ class TableTracker:
                    os.makedirs(os.path.join(save_dir, card_label), exist_ok = True)
 
             # load classification model 
-            checkpoint_path = "mobilenet_card.pt" 
+            # checkpoint_path = "mobilenet_card.pt" 
+            checkpoint_path = "working/best.pt" 
             logger.info(f"[CARD CLS] loading card classifier model:{checkpoint_path}")
             card_classifier = mobilenet_card.load_model(checkpoint_path)
             card_preprocessor  = mobilenet_card.load_image_preprocessor()
@@ -659,23 +660,30 @@ def test(img_file):
     
     
 if __name__ == "__main__":
-    
-    if False:
-        #img_file = os.path.join("dataset_h", "img_000000690.jpg")
-        img_file = os.path.join("dataset", "img_000000024.jpg")
-        test(img_file)
+
+    import argparse
+
+    parser = argparse.ArgumentParser(description="AI Table Game Monitor — inference on baccarat video.")
+    parser.add_argument("template",  help="Layout image file  (e.g. gkl_table1_layout.jpg)")
+    parser.add_argument("video",     help="Input video file   (e.g. gkl_mask1.avi)")
+    parser.add_argument("--save",    action="store_true",
+                        help="Save the annotated inference video to disk")
+    parser.add_argument("--output",  default="baccarat_annotated.mp4",
+                        help="Output video filename  (default: baccarat_annotated.mp4, only used with --save)")
+    parser.add_argument("--no-viz",  action="store_true",
+                        help="Disable on-screen display (useful when running headless with --save)")
+    args = parser.parse_args()
+
+    record_file = args.output if args.save else None
+    viz         = not args.no_viz
+    keep_align  = False
+
+    if record_file:
+        logger.info(f"Inference video will be saved → {record_file}")
     else:
-        import sys
-        if len(sys.argv) <3:
-            logger.info(f"usage: python {sys.argv[0]} layout_img videofile")
-            exit()
-        #template_file ="tablelayout.jpg"   # template  
-        #video_file  = "2025_10_02 15_36.mp4"
-        template_file = sys.argv[1]  
-        video_file = sys.argv[2]
-        record_file = "baccarat_annotated.mp4"
-        keep_align = False
-        TableTracker.run(template_file, video_file, keep_align, True, record_file)  
+        logger.info("Video saving disabled  (pass --save to enable)")
+
+    TableTracker.run(args.template, args.video, keep_align, viz, record_file)
 
 
 

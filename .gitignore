@@ -225,7 +225,8 @@ dataset_gkl_cards/
 dataset_bee_cards/
 
 # addition folder dont need to upload
-additionals/
+# additionals/
+working/
 
 # Generated / augmented dataset output folders
 dataset_gkl_cards/augmented*/

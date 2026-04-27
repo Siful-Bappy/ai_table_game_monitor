@@ -1,493 +1,493 @@
+"""
+MobileNet Card Classifier
+=========================
+Training and inference for the GKL card dataset.
+
+Dataset layout (produced by augment_dataset.py):
+    <dataset_dir>/
+        train/  <class_name>/  aug_0000.jpg ...
+        val/    <class_name>/  val_0000.jpg ...
+
+Usage
+-----
+    # Step 1 – compute & cache dataset mean/std (run once)
+    python mobilenet_card_classifier.py stats  dataset_gkl_cards/augmented
+
+    # Step 2 – train
+    python mobilenet_card_classifier.py train  dataset_gkl_cards/augmented
+
+    # Step 3 – evaluate on val folder
+    python mobilenet_card_classifier.py test   dataset_gkl_cards/augmented/val
+
+    # Predict a single image
+    python mobilenet_card_classifier.py test   path/to/card.jpg
+"""
+
 import os
 import json
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-from glob import glob
-#%matplotlib inline
-from PIL import Image
+import random
+import pickle
+import shutil
+
 import cv2
+import numpy as np
+from glob import glob
+from PIL import Image
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
-
-#### Check dataset ########################################
- 
-def check_card_dataset(dataset_dir):
-
-    card_csv = pd.read_csv(os.path.join(dataset_dir, "cards.csv"))
-    # change column name
-    card_csv.columns = ["class", "filepaths", "labels", "card_type", "data_set"]
-
-    if True:  # label info 
-        #card_list = list(set(card_csv["labels"]))
-        card_label_list = sorted(list(set(card_csv["labels"])))  # *** IMPORTANT *** KEEP ORDERING *** should sort !!!!!!
-        with open('card_labels.json', 'w') as f:
-            json.dump(card_label_list,  f, indent=4, ensure_ascii=False)
-
-    # plot to see the card Image in category
-    n = 0
-    count = 0
-    plot_idx = 1
-    for i in range(len(card_csv)):
-        if card_csv["class"].iloc[i] == n:
-            # Joker has no spade, heart, dia, clover
-            if card_csv["labels"].iloc[i] == "joker":
-                n += 1
-                continue
-
-            path = os.path.join(dataset_dir, card_csv["filepaths"].iloc[i])
-            img = Image.open(path)
-            plt.subplot(13, 4, plot_idx)
-            plt.imshow(img)
-            plt.axis("off")
-            n += 1
-            count += 1
-            plot_idx += 1
-        if count == 4:
-            count = 0
-    plt.show()
-
-
-###  Mobilenet ###############################################
-
+from tqdm import tqdm
 import timm
-def check_models():
 
-    # Find mobilenetv1~ (which is pretrained)
-    print(timm.list_models("mobilenetv1*", pretrained=True),"\n")
-    # Decision model
-    model = timm.create_model("mobilenetv1_125.ra4_e3600_r224_in1k", pretrained=True)
 
-    # Check model information
-    print(model.default_cfg, "\n") # Model default info
-    print(model.global_pool, "\n") # Model global_pool
-    print(model.get_classifier(), "\n") # In/Out Linear info
+NUM_CLASSES = 53
+WORKING_DIR = "./working"
+STATS_PATH  = os.path.join(WORKING_DIR, "dataset_stats.json")
 
+
+# -----------------------------------------------------------------------
+# Dataset statistics  (Step 1 — run once before training)
+# -----------------------------------------------------------------------
+
+def compute_dataset_stats(dataset_dir, max_samples=3000):
+    """
+    Compute per-channel mean and std from training images (BGR→RGB, [0,1]).
+    Saves result to STATS_PATH so it only needs to run once.
+
+    Returns
+    -------
+    mean, std : list[float] — three values each, in [0, 1]
+    """
+    img_paths = glob(os.path.join(dataset_dir, "train/*/*.jpg"))
+    if not img_paths:
+        raise ValueError(f"No training images found under {dataset_dir}/train/")
+
+    random.shuffle(img_paths)
+    img_paths = img_paths[:max_samples]
+
+    mean = np.zeros(3, dtype=np.float64)
+    sq   = np.zeros(3, dtype=np.float64)
+    n    = 0
+
+    print(f"Computing dataset stats from {len(img_paths)} images ...")
+    for path in tqdm(img_paths):
+        img = cv2.imread(path)
+        if img is None:
+            continue
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+        mean += img.mean(axis=(0, 1))
+        sq   += (img ** 2).mean(axis=(0, 1))
+        n    += 1
+
+    mean /= n
+    std   = np.sqrt(np.maximum(sq / n - mean ** 2, 0))
+
+    stats = {"mean": mean.tolist(), "std": std.tolist(), "n_samples": n}
+    os.makedirs(WORKING_DIR, exist_ok=True)
+    with open(STATS_PATH, "w") as f:
+        json.dump(stats, f, indent=4)
+
+    print(f"  Mean : {[round(v, 4) for v in stats['mean']]}")
+    print(f"  Std  : {[round(v, 4) for v in stats['std']]}")
+    print(f"  Saved → {STATS_PATH}")
+    return stats["mean"], stats["std"]
+
+
+def load_dataset_stats():
+    """
+    Load cached mean/std from STATS_PATH.
+    Falls back to ImageNet defaults if the file does not exist yet.
+    """
+    if os.path.exists(STATS_PATH):
+        with open(STATS_PATH) as f:
+            s = json.load(f)
+        print(f"Loaded stats from {STATS_PATH}")
+        print(f"  Mean : {[round(v, 4) for v in s['mean']]}")
+        print(f"  Std  : {[round(v, 4) for v in s['std']]}")
+        return s["mean"], s["std"]
+
+    print(f"WARNING: {STATS_PATH} not found — run 'stats' command first.")
+    print("Falling back to ImageNet defaults.")
+    # return [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
+    return [0.687, 0.726, 0.766], [0.338, 0.310, 0.264]
+
+
+
+# -----------------------------------------------------------------------
+# Model
+# -----------------------------------------------------------------------
 
 class MobileNet(nn.Module):
     def __init__(self):
         super().__init__()
-        self.model = timm.create_model("mobilenetv1_125.ra4_e3600_r224_in1k", num_classes = 53, global_pool = "avg", pretrained=True)
-    
+        self.model = timm.create_model(
+            "mobilenetv1_125.ra4_e3600_r224_in1k",
+            num_classes=NUM_CLASSES,
+            global_pool="avg",
+            pretrained=True,
+        )
+
     def forward(self, x):
         return self.model(x)
 
 
-# 2. Dataset, DataLoader
-
-from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms
+# -----------------------------------------------------------------------
+# Dataset & DataLoader
+# -----------------------------------------------------------------------
 
 class MyDataset(Dataset):
-    def __init__(self, img_path, class_list, tf = None):
-        self.transform = tf
-        self.path = img_path
+    """
+    Loads JPEG images from a folder tree:  <root>/<class_name>/<img>.jpg
+    Class index is derived from class_list (must match card_labels.json order).
+    """
+    def __init__(self, img_paths, class_list, tf=None):
+        self.paths      = img_paths
         self.card_class = class_list
+        self.transform  = tf
 
-    def get_image(self, filename):
-        img = Image.open(filename).convert("RGB")
-        img = self.transform(img)
-        return img
-    
-    def __getitem__(self, idx):
-        img_ = self.path[idx]
-        img = self.get_image(img_)
-        cls_name = os.path.basename(os.path.dirname(img_))
-        label = self.card_class.index(cls_name)  ####  **** IT is Why SORT *****
-        return img, label
-    
     def __len__(self):
-        return len(self.path)
+        return len(self.paths)
 
-# DataLoader (with device type)
-class DeviceDL():
+    def __getitem__(self, idx):
+        path     = self.paths[idx]
+        img      = Image.open(path).convert("RGB")
+        if self.transform:
+            img = self.transform(img)
+        cls_name = os.path.basename(os.path.dirname(path))
+        label    = self.card_class.index(cls_name)   # sort order must match!
+        return img, label
+
+
+class DeviceDL:
+    """Wraps a DataLoader and moves every batch to GPU/CPU automatically."""
     def __init__(self, dl):
-        self.dl = dl
-        # If Cuda is available
-        if torch.cuda.is_available():
-            self.device = torch.device("cuda")
-        else:
-            self.device = torch.device("cpu")
-        
-    def to_device(self, data):
-        # If data is (list or tuple)
+        self.dl     = dl
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    def _to(self, data):
         if isinstance(data, (list, tuple)):
-            return [self.to_device(x) for x in data]
-        # Data to device(cuda)
+            return [self._to(x) for x in data]
         return data.to(self.device)
-    
+
     def __iter__(self):
-        for b in self.dl:
-            yield self.to_device(b)
+        for batch in self.dl:
+            yield self._to(batch)
 
     def __len__(self):
         return len(self.dl)
 
 
+# -----------------------------------------------------------------------
+# Training helpers
+# -----------------------------------------------------------------------
 
-### Train ###################################
-
-# Model train tool
-import torch.nn.functional as F
-import pickle
-
-class TrainHelper():
-
-    def __init__(self, save_path = "./working/history.pickle", history=[]):
-        self.history = history
+class TrainHelper:
+    def __init__(self, save_path=os.path.join(WORKING_DIR, "history.pickle"),
+                 history=None):
+        self.history   = history or []
         self.save_path = save_path
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
 
     def accuracy(self, outputs, labels):
-        pred = torch.argmax(outputs, dim=1)  # 예측 인덱스
+        pred = torch.argmax(outputs, dim=1)
         return torch.tensor(torch.sum(pred == labels).item() / len(pred))
-        
-    @torch.no_grad()
-    def validation(self, model, batch):
-        images, labels = batch
-        out = model(images)
-        acc = self.accuracy(out, labels)
-        loss = F.cross_entropy(out, labels)
-        return {'val_loss': loss.detach(), 'val_acc': acc}
 
     @torch.no_grad()
-    def evaluation(self, model, data_loader):
+    def _validate_batch(self, model, batch):
+        imgs, labels = batch
+        out  = model(imgs)
+        return {
+            "val_loss": F.cross_entropy(out, labels).detach(),
+            "val_acc":  self.accuracy(out, labels),
+        }
+
+    @torch.no_grad()
+    def evaluation(self, model, loader):
         model.eval()
-        outputs = [self.validation(model, batch) for batch in data_loader]
-        batch_losses = [x['val_loss'] for x in outputs]
-        epoch_loss = torch.stack(batch_losses).mean()
-        batch_accs = [x['val_acc'] for x in outputs]
-        epoch_acc = torch.stack(batch_accs).mean()
-        return {'val_loss': round(epoch_loss.item(), 5), 'val_acc': round(epoch_acc.item(), 5)}
+        results    = [self._validate_batch(model, b) for b in loader]
+        epoch_loss = torch.stack([r["val_loss"] for r in results]).mean()
+        epoch_acc  = torch.stack([r["val_acc"]  for r in results]).mean()
+        return {
+            "val_loss": round(epoch_loss.item(), 5),
+            "val_acc":  round(epoch_acc.item(),  5),
+        }
 
     def logging(self, epoch, result):
-        print("Epoch {}: train_loss: {:.4f}, val_loss: {:.4f}, val_acc: {:.4f}".format(
-            epoch, result['train_loss'], result['val_loss'], result['val_acc']))
-
+        print("Epoch {:>3}:  train_loss={:.4f}  val_loss={:.4f}  val_acc={:.4f}".format(
+            epoch, result["train_loss"], result["val_loss"], result["val_acc"]))
         self.history.append(result)
-        
-        with open(self.save_path, 'wb') as f:
+        with open(self.save_path, "wb") as f:
             pickle.dump(self.history, f)
 
 
-def train(checkpoint_path, dataset_dir):            
+# -----------------------------------------------------------------------
+# Train  (Step 2)
+# -----------------------------------------------------------------------
 
-    # Labels # Is Label ok?
+def train(dataset_dir, checkpoint_path=None, epochs=100, batch_size=32, lr=1e-3):
+    """
+    Train MobileNet on the augmented GKL card dataset.
+
+    Parameters
+    ----------
+    dataset_dir     : folder containing train/ and val/ sub-folders
+    checkpoint_path : optional .pt file to resume training from
+    epochs          : training epochs
+    batch_size      : mini-batch size
+    lr              : initial learning rate (Adam + CosineAnnealing)
+    """
+    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device : {DEVICE}\n")
+
+    # ── Labels ──────────────────────────────────────────────────────────
     with open("card_labels.json", "r", encoding="utf-8") as f:
-         card_label_list = json.load(f)
+        card_label_list = json.load(f)
+    print(f"Classes : {len(card_label_list)}")
 
-    # 1. create a model  
-    model = load_model(checkpoint_path, train_mode = True)
-    
-    # 2. data loader 
-    # 2.1 path     
-    train_img_paths = glob(os.path.join(dataset_dir, "train/*/*.jpg"))
-    valid_img_paths = glob(os.path.join(dataset_dir, "valid/*/*.jpg"))
-    # 2.2 tranformer 
-    train_transform = transforms.Compose([
+    # ── Dataset mean / std ──────────────────────────────────────────────
+    mean, std = load_dataset_stats()
+
+    # ── Model ───────────────────────────────────────────────────────────
+    model = MobileNet()
+    if checkpoint_path and os.path.exists(checkpoint_path):
+        model.load_state_dict(torch.load(checkpoint_path, map_location=DEVICE))
+        print(f"Resumed from checkpoint: {checkpoint_path}")
+    else:
+        print("Starting fresh (pretrained ImageNet backbone).")
+    model.to(DEVICE)
+
+    # ── Transforms ──────────────────────────────────────────────────────
+    # Images are already 224×224 from augment_dataset.py.
+    # Resize to 256 first so RandomCrop gives spatial diversity.
+    train_tf = transforms.Compose([
         transforms.Resize((256, 256)),
         transforms.RandomCrop(224),
         transforms.RandomHorizontalFlip(),
+        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1),
         transforms.ToTensor(),
-        transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
+        transforms.Normalize(mean, std),
     ])
-    val_transform = transforms.Compose([
+    val_tf = transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.ToTensor(),
-        transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
+        transforms.Normalize(mean, std),
     ])
-    # 2.3 dataset
-    train_dataset = MyDataset(train_img_paths, card_label_list, tf = train_transform)
-    valid_dataset = MyDataset(valid_img_paths, card_label_list, tf = val_transform)
-    # 2.4 dataloader
-    train_dataloader = DataLoader(train_dataset, batch_size = 64, shuffle = True)
-    valid_dataloader = DataLoader(valid_dataset, batch_size = 64, shuffle = True)
-    train_dl = DeviceDL(train_dataloader)  
-    valid_dl = DeviceDL(valid_dataloader)
 
-    # 2. train 
-    from tqdm import tqdm
-    epochs = 20
-    optimizer = torch.optim.Adam(model.parameters(), lr = 1e-3)
-    val_acc_best = 0
-    save_model_pth = "./working/"
-    os.makedirs(save_model_pth, exist_ok=True)
-    save_model_name = ""
-    best_model_name = ""
-    train_helper = TrainHelper()
+    # ── Image paths ─────────────────────────────────────────────────────
+    train_paths = glob(os.path.join(dataset_dir, "train/*/*.jpg"))
+    val_paths   = glob(os.path.join(dataset_dir, "val/*/*.jpg"))
 
-    for epoch in range(epochs):
+    if not train_paths:
+        raise ValueError(f"No images found in {dataset_dir}/train/")
+    if not val_paths:
+        raise ValueError(f"No images found in {dataset_dir}/val/")
+
+    print(f"Train images : {len(train_paths)}")
+    print(f"Val   images : {len(val_paths)}\n")
+
+    # ── DataLoaders ─────────────────────────────────────────────────────
+    num_workers = 4 if os.name != "nt" else 0   # 0 on Windows
+    train_dl = DeviceDL(DataLoader(
+        MyDataset(train_paths, card_label_list, tf=train_tf),
+        batch_size=batch_size, shuffle=True,
+        num_workers=num_workers, pin_memory=True,
+    ))
+    val_dl = DeviceDL(DataLoader(
+        MyDataset(val_paths, card_label_list, tf=val_tf),
+        batch_size=batch_size, shuffle=False,
+        num_workers=num_workers, pin_memory=True,
+    ))
+
+    # ── Optimiser + scheduler ───────────────────────────────────────────
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+
+    os.makedirs(WORKING_DIR, exist_ok=True)
+    helper       = TrainHelper()
+    best_acc     = 0.0
+    best_ckpt    = ""
+
+    # ── Training loop ───────────────────────────────────────────────────
+    for epoch in range(1, epochs + 1):
         model.train()
         train_losses = []
 
-        # 2.1 Train
-        for batch in tqdm(train_dl):
-            img, label = batch
-            outputs = model(img)
+        for imgs, labels in tqdm(train_dl, desc=f"Epoch {epoch}/{epochs}", leave=False):
             optimizer.zero_grad()
-            loss = F.cross_entropy(outputs, label)
-            train_losses.append(loss)
+            loss = F.cross_entropy(model(imgs), labels)
             loss.backward()
             optimizer.step()
+            train_losses.append(loss.detach())
 
-        # 2.2 Valid
-        result = train_helper.evaluation(model, valid_dl)
+        scheduler.step()
+
+        result = helper.evaluation(model, val_dl)
         result["train_loss"] = torch.stack(train_losses).mean().item()
 
-        # Save the best model
-        if result["val_acc"] > val_acc_best:
-            val_acc_best = result["val_acc"]
-            save_model_name = os.path.join(save_model_pth, f"best_ep_{epoch}_{val_acc_best}.pt")
-            best_model_name = save_model_name
-            torch.save(model.state_dict(), save_model_name)
-            print(f"Saved PyTorch Model State to {save_model_name}")
+        if result["val_acc"] > best_acc:
+            best_acc  = result["val_acc"]
+            best_ckpt = os.path.join(WORKING_DIR, f"best_ep{epoch}_{best_acc:.4f}.pt")
+            torch.save(model.state_dict(), best_ckpt)
+            print(f"  ✓ New best → {best_ckpt}")
 
-        train_helper.logging(epoch, result)
-    
-    # Test Result
-    test_transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
-    ])
-    
-    '''
-    test_img = glob("./test/*/*.jpg")
-    test_dataset = MyDataset(test_img, card_list, tf = test_transform)
-    test_dataloader = DataLoader(test_dataset, batch_size = 64, shuffle = True) 
-    test_dl = DeviceDL(test_dataloader)
- 
-    print("Test Check : ", train_helper.evaluation(model, test_dl))
-    #save_model_name = os.path.join(save_model_pth, f"last_{val_acc_best}.pt")
-    '''
-    import shutil
-    final_model_name = os.path.join(save_model_pth, f"best.pt")
-    shutil.copy(best_model_name, final_model_name)
-    
+        helper.logging(epoch, result)
 
-### Test All #############################################################
-    
-def test_all(model, dataset_dir, card_label_list):
+    # Copy best weights as canonical best.pt
+    final_path = os.path.join(WORKING_DIR, "best.pt")
+    if best_ckpt:
+        shutil.copy(best_ckpt, final_path)
+        print(f"\nBest model saved → {final_path}  (val_acc={best_acc:.4f})")
 
-   
-    # 1. model
-    '''
-    # Define the device once
+
+# -----------------------------------------------------------------------
+# Inference / Export API
+# -----------------------------------------------------------------------
+
+def load_model(checkpoint_path=None, train_mode=False):
+    """Load MobileNet weights. Creates a fresh model if checkpoint not found."""
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {DEVICE}")
+    model  = MobileNet()
 
-   
-    save_model_pth = "./working/"
-    checkpoint_path = os.path.join(save_model_pth, "best.pt")
-
-    if not os.path.exists(checkpoint_path):
-        # If running test() without prior train(), this path will be missing.
-        raise ValueError(f"'{checkpoint_path}' is not a valid checkpoint path. Please run train() first.")
-
-    # Instantiate the model
-    model = MobileNet()
-    
-    # Load the state dictionary, mapping it to the defined device
-    # This correctly handles loading a CUDA-trained model onto a CPU machine (or vice-versa)
-    model.load_state_dict(torch.load(checkpoint_path, map_location=DEVICE))
-    
-    # Move the model itself to the defined device
-    model.to(DEVICE)
-    
-    # Set model to evaluation mode
-    model.eval()  # IMPORTANT for inference
-    '''
-    
-    # 2. dataset
-    test_transform =  load_image_preprocessor()
-    '''
-    test_transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
-    ])
-    '''
-    
-    #test_img = glob("./test/*/*.jpg")
-    test_img = glob(os.path.join(dataset_dir, "*/*.jpg"))
-    test_dataset = MyDataset(test_img, card_label_list, tf = test_transform)
-    # Ensure shuffle is False for consistent, reproducible testing
-    test_dataloader = DataLoader(test_dataset, batch_size = 64, shuffle = False)
-    
-    # DeviceDL handles moving the data to the correct device (based on torch.cuda.is_available()
-    # which aligns with the DEVICE defined above)
-    test_dl = DeviceDL(test_dataloader)
-    
-    # 3. Test Result
-    test_helper = TrainHelper()
-    
-    # test_helper.evaluation expects the model and data to be on the correct device, 
-    # which is handled by model.to(DEVICE) and DeviceDL.
-    test_result = test_helper.evaluation(model, test_dl)
-    
-    print("Test Check : ", test_result)
-    
-    
-### Export API ##################################################################
-
-def load_model(checkpoint_path = None, train_mode = False):
-
-    # 1. Define Device and Checkpoint Path
-    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-  
-    if not os.path.exists(checkpoint_path):
-        print(f"Error: Checkpoint not found at {checkpoint_path}. Run train() first.")
-        return None
-
-    # 3. Load Model
-    # Instantiate the model (Ensure MobileNet class is available in scope)
-    model = MobileNet() 
-    if checkpoint_path is not None:
+    if checkpoint_path and os.path.exists(checkpoint_path):
         model.load_state_dict(torch.load(checkpoint_path, map_location=DEVICE))
-    
+        print(f"Loaded weights from {checkpoint_path}")
+    elif not train_mode:
+        print(f"WARNING: checkpoint not found at '{checkpoint_path}'. Weights are random.")
+
     model.to(DEVICE)
     if not train_mode:
-        model.eval()  # Set model to evaluation mode (CRITICAL)
-    
+        model.eval()
     return model
 
-def load_image_preprocessor():
 
-    # 'test' transform
-    test_transform = transforms.Compose([
+def load_image_preprocessor():
+    """Return the inference transform using cached dataset mean/std."""
+    mean, std = load_dataset_stats()
+    return transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.ToTensor(),
-        transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
+        transforms.Normalize(mean, std),
     ])
 
-    return test_transform
 
-    
 def classify_card(model, preprocessor, image_or_path):
-
     """
-    Tests a single image using the saved MobileNet model.
+    Classify a single card image.
 
-    Args:
-        image_path (str): The file path to the image to test.
-        #card_list (list): The sorted list of all class labels.
+    Parameters
+    ----------
+    image_or_path : str (file path) | np.ndarray (BGR from cv2) | PIL.Image
 
-    Returns:
-        str: The predicted card label.
+    Returns
+    -------
+    (predicted_index, confidence_float)
     """
-
-    #  Load and Transform Image
     device = next(model.parameters()).device
+
     if isinstance(image_or_path, str):
-        try:
-            img = Image.open(image_or_path).convert("RGB")
-            # Apply transforms and add a batch dimension (1, C, H, W)
-            input_tensor = preprocessor(img).unsqueeze(0).to(device)
-        except FileNotFoundError:
-            return f"Error: Image file not found at {image_or_path}"
-
+        img = Image.open(image_or_path).convert("RGB")
     elif isinstance(image_or_path, np.ndarray):
-        img_pil = Image.fromarray(image_or_path)
-        input_tensor = preprocessor(img_pil).unsqueeze(0).to(device)
+        # cv2 delivers BGR — convert to RGB for PIL / torchvision
+        img = Image.fromarray(cv2.cvtColor(image_or_path, cv2.COLOR_BGR2RGB))
+    else:
+        img = image_or_path  # assume PIL Image already
 
-    else: # make sure it is a PIL
-        img_pil = image_or_path
-        device = next(model.parameters()).device
-        input_tensor = preprocessor(img_pil).unsqueeze(0).to(device)
-
-    # Prediction (single) : @TODO batch 
+    tensor = preprocessor(img).unsqueeze(0).to(device)
     with torch.no_grad():
-        output = model(input_tensor)
-        # Apply softmax to get probabilities (optional, but good practice)
-        probabilities = torch.nn.functional.softmax(output, dim=1)
-        # Get the index of the highest probability
-        predicted_index = torch.argmax(probabilities, dim=1).item()
-        #print(f"prob:{probabilities}")
-    return predicted_index, probabilities[0,predicted_index]
+        probs = torch.softmax(model(tensor), dim=1)
+        idx   = torch.argmax(probs, dim=1).item()
+    return idx, probs[0, idx].item()
+
 
 def classify_cards(model, preprocessor, cards):
-
     """
-    Tests a batch images using the saved MobileNet model.
+    Classify a batch of card images (numpy BGR from cv2).
 
-    Args:
-        cards: list of numpy cards  
-
-    Returns:
-        indices of cards and probs   
-
+    Returns
+    -------
+    indices    : torch.Tensor shape (N,)
+    confidence : torch.Tensor shape (N,)
     """
-
     device = next(model.parameters()).device
+    batch  = torch.stack([
+        preprocessor(Image.fromarray(cv2.cvtColor(im, cv2.COLOR_BGR2RGB)))
+        for im in cards
+    ]).to(device)
 
-    # Preprocess batch (each im is numpy HWC)
-    batch = torch.stack([preprocessor(Image.fromarray(im)) for im in cards])
-    batch = batch.to(device)
-
-    # Inference
     with torch.no_grad():
-        output = model(batch)                           # shape (N, num_classes)
-        probs_all = torch.softmax(output, dim=1)        # convert to probabilities
-        predicted_indices = torch.argmax(probs_all, dim=1)
-        predicted_probs = torch.max(probs_all, dim=1).values
+        probs_all  = torch.softmax(model(batch), dim=1)
+        indices    = torch.argmax(probs_all, dim=1)
+        confidence = torch.max(probs_all, dim=1).values
 
-    # Return tensors or convert to lists
-    return predicted_indices.cpu(), predicted_probs.cpu()
+    return indices.cpu(), confidence.cpu()
 
 
-# Keep the original main block for execution flow:
+def test_all(model, dataset_dir, card_label_list):
+    """Evaluate model accuracy on all images under dataset_dir/*/*.jpg."""
+    preprocessor = load_image_preprocessor()
+    test_paths   = glob(os.path.join(dataset_dir, "*/*.jpg"))
+    if not test_paths:
+        print(f"No images found under {dataset_dir}")
+        return
+
+    test_dl = DeviceDL(DataLoader(
+        MyDataset(test_paths, card_label_list, tf=preprocessor),
+        batch_size=64, shuffle=False,
+    ))
+    result = TrainHelper().evaluation(model, test_dl)
+    print(f"Test result  :  val_loss={result['val_loss']}  val_acc={result['val_acc']}")
+
+
+# -----------------------------------------------------------------------
+# CLI entry point
+# -----------------------------------------------------------------------
+
 if __name__ == "__main__":
-
     import sys
 
+    def _usage():
+        print("Usage:")
+        print("  python mobilenet_card_classifier.py stats  <dataset_dir>")
+        print("  python mobilenet_card_classifier.py train  <dataset_dir>")
+        print("  python mobilenet_card_classifier.py test   <dataset_dir/val  |  image.jpg>")
+        sys.exit(1)
+
     if len(sys.argv) < 3:
-        print("usage:python {sys.argv[0]} check/train/test file/directory") 
+        _usage()
 
-    if sys.argv[1] == "check":
-        check_card_dataset(sys.argv[2])
-        
-    elif sys.argv[1] == "train":
-        checkpoint_path = os.path.join("working", "best.pt")
-        model = load_model(checkpoint_path, True)
-        train(model, sys.argv[2])
-         
-    elif sys.argv[1] == "test" and os.path.isdir(sys.argv[2]):   
-        checkpoint_path = os.path.join("working", "best.pt")
-        model = load_model(checkpoint_path)
+    cmd = sys.argv[1]
+
+    if cmd == "stats":
+        compute_dataset_stats(sys.argv[2])
+
+    elif cmd == "train":
+        dataset_dir     = sys.argv[2]
+        checkpoint_path = os.path.join(WORKING_DIR, "best.pt")
+        # Auto-compute stats if not cached yet
+        if not os.path.exists(STATS_PATH):
+            print("Stats not found — computing now ...\n")
+            compute_dataset_stats(dataset_dir)
+        train(dataset_dir, checkpoint_path=checkpoint_path)
+
+    elif cmd == "test":
         with open("card_labels.json", "r", encoding="utf-8") as f:
             card_label_list = json.load(f)
-        test_all(model, sys.argv[2], card_label_list)
-    elif sys.argv[1] == "test" and not os.path.isdir(sys.argv[2]) and sys.argv[2][-3:] in ["jpg", "png"] :   
-    
-        with open("card_labels.json", "r", encoding="utf-8") as f:
-            card_label_list = json.load(f)
-
-        #checkpoint_path = os.path.join("working", "best.pt")
-        checkpoint_path = "mobilenet_card.pt"
+        checkpoint_path = os.path.join(WORKING_DIR, "best.pt")
         model = load_model(checkpoint_path)
-        print("model type:", type(model.model))
-        preprocessor  = load_image_preprocessor()
-        if model is None or preprocessor is None:
-            print("cannot load model or transformer")
-            exit()
 
-        single_image_path = sys.argv[2]  #single_image_path = "./test/ace of spades/1.jpg"
-        if False: # using file path 
-            idx_pred, prob = classify_card(model, preprocessor, single_image_path)
+        target = sys.argv[2]
+        if os.path.isdir(target):
+            test_all(model, target, card_label_list)
         else:
-          
-            single_image = cv2.imread(single_image_path)
-            idx_pred, prob = classify_card(model, preprocessor, single_image)
-        label_pred = card_label_list[idx_pred] # Use the predicted index to look up the label in the (sorted) card_list
-        print(f"\nImage: {single_image_path}: Prediction: {label_pred}")
+            preprocessor    = load_image_preprocessor()
+            idx, confidence = classify_card(model, preprocessor, target)
+            print(f"Prediction : {card_label_list[idx]}  (confidence {confidence:.3f})")
+            img = cv2.imread(target)
+            cv2.imshow("card", img)
+            cv2.waitKey(0)
 
-        img = cv2.imread(single_image_path)
-        cv2.imshow("card", np.array(img))
-        cv2.waitKey(0)
-        #img.show()
-
-
-     # TODO : use numpy image for classification 
-
-
+    else:
+        _usage()

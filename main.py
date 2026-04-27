@@ -502,46 +502,54 @@ class TableTracker:
                         cv2.putText(frame, f"ID:{track_id}/CLS:{tracker.id2class[track_id]}", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
             else:
                 
-                cnts = [0,0,0] 
-                card_list = []
+                cnts = [0,0,0]
+                banker_cards = []   # cards detected in the banker zone
+                player_cards = []   # cards detected in the player zone
                 positions = [[],[],[]]
                 for det in detect_list:
-                    x1, y1, x2, y2, conf, cls = det   # TL, BR, conf, cls 
+                    x1, y1, x2, y2, conf, cls = det   # TL, BR, conf, cls
                     x1, y1, x2, y2, cls = int(x1), int(y1), int(x2), int(y2), int(cls)
                     cx, cy = (x1+x2)//2, (y1+y2)//2
-                    if cls in [0, 1]:  # except card for now 
+
+                    # Resolve layout zone for every detection (needed for card routing, not just viz)
+                    layout_label = "bg"
+                    if 0 < cx < width and 0 < cy < height:
+                        layout_label_id = layout_pixmap[cy, cx]
+                        layout_label    = layout_id2label[layout_label_id]
+                        if not layout_label:
+                            layout_label = "bg"
+
+                    if cls in [0, 1]:  # hand / chip
                         cnts[cls] +=1
                     elif cls == 2:
-                        # wrong card region is detected multiple times: filtering using size hints and overlap (IOUs)
-                        if y2-y1 > x2-x1: #  portrait
+                        # filtering using size hints
+                        if y2-y1 > x2-x1:  # portrait
                             if min_height_card <= (y2-y1) <= max_height_card:
-                                #statistics_card_len.append(y2-y1) 
                                 cnts[cls] +=1
                                 if opt_classify_card:
                                     img_card = cv2.resize(frame_o[2*y1:2*y2,2*x1:2*x2,:], (width_card,height_card))
-                                    card_list.append(img_card)
+                                    if "bank" in layout_label.lower():
+                                        banker_cards.append(img_card)
+                                    else:
+                                        player_cards.append(img_card)
                             else:
-                                pass # ignore it       
-                                    
-                        else:  #  landsacpae (3rd cards)-> rotate
+                                pass # ignore it
+
+                        else:  # landscape (3rd card) -> rotate
                             if min_height_card <= (x2-x1) <= max_height_card:
-                                #statistics_card_len.append(x2-x1)
                                 cnts[cls] +=1
                                 if opt_classify_card:
-                                    img_card = cv2.resize(cv2.rotate(frame_o[2*y1:2*y2,2*x1:2*x2,:], cv2.ROTATE_90_CLOCKWISE), (width_card,height_card))      
-                                    card_list.append(img_card)
+                                    img_card = cv2.resize(cv2.rotate(frame_o[2*y1:2*y2,2*x1:2*x2,:], cv2.ROTATE_90_CLOCKWISE), (width_card,height_card))
+                                    if "bank" in layout_label.lower():
+                                        banker_cards.append(img_card)
+                                    else:
+                                        player_cards.append(img_card)
                             else:
-                                pass # ignore it   
-                        
-                    if viz:  #  after taking ROI 
-                        cv2.rectangle(frame, (x1, y1),  (x2,y2), viz_colors[cls], 2)
-                        if 0 < cx < width and 0 < cy < height:
-                            layout_label_id = layout_pixmap[cy,cx]
-                            layout_label    = layout_id2label[layout_label_id]
-                            #cv2.putText(frame, f"{layout_label:3s}", (cx-10, cy+10), cv2.FONT_HERSHEY_SIMPLEX, 0.4, viz_colors[cls], 1)
-                            if len(layout_label) < 1: 
-                               layout_label = "bg"
-                            positions[cls].append(layout_label)
+                                pass # ignore it
+
+                    if viz:  # draw bbox after routing
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), viz_colors[cls], 2)
+                        positions[cls].append(layout_label)
 
                 
                 logger.info(f"fn={fn}, {cnts[0]} hands, {','.join(positions[0])}")
@@ -566,31 +574,64 @@ class TableTracker:
             # @TODO
         
         
-            # 2.6. detail info: card classification etc 
+            # 2.6. detail info: card classification
             if opt_classify_card:
-                if len(card_list)>0:
-                    img_cards = cv2.hconcat(card_list)
-                    pred_ids, probs = mobilenet_card.classify_cards(card_classifier, card_preprocessor, card_list)
-                    for i in range(len(card_list)):
-                        img_card = card_list[i]
-                        pred_id = pred_ids[i]
-                        label = card_label_list[pred_id] # Use the predicted index to look up the label in the (sorted) card_list
-                        prob  = probs[i]
-                        #logger.debug(f"\ncard class:{label}")         
-                        if save_card:
-                             cv2.imwrite(os.path.join(save_dir, label, f"{fn}_{i}.jpg"), img_card) 
-                        if viz:
-                             cv2.putText(img_cards, f"{label:.16s}", (i*width_card + 20 , 40), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 2)  
-                             #cv2.putText(img_cards, f"conf:{prob:.2f}", (i*width_card + 20 , 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)                                            
-                    width_pnp, height_pnp = min(width, len(card_list)*width_card//2), height_card//2
-                    if width_pnp == width:
-                        logger.warning (f"too many ({len(card_list)}) cards detected")
-                    img_cards = cv2.resize(img_cards, (width_pnp,  height_pnp)) 
-                    frame[0:height_pnp,-width_pnp:,:] = img_cards[:,:,:]         
+                all_cards = banker_cards + player_cards
+                if all_cards:
+                    pred_ids, probs = mobilenet_card.classify_cards(
+                        card_classifier, card_preprocessor, all_cards)
+
+                    # Save every card crop to its predicted class folder
+                    if save_card:
+                        for i, img_c in enumerate(all_cards):
+                            lbl = card_label_list[pred_ids[i]]
+                            cv2.imwrite(os.path.join(save_dir, lbl, f"{fn}_{i}.jpg"), img_c)
+
+                    if viz:
+                        THUMB_W, THUMB_H = width_card // 2, height_card // 2
+
+                        LABEL_H = 20   # height of the label bar below each card
+
+                        def _make_strip(cards, id_offset):
+                            """Full card thumbnail + label bar below (no overlap)."""
+                            thumbs = []
+                            for j, img_c in enumerate(cards):
+                                th  = cv2.resize(img_c, (THUMB_W, THUMB_H))
+                                lbl = card_label_list[pred_ids[id_offset + j]]
+                                # Separate black bar below the card image
+                                bar = np.zeros((LABEL_H, THUMB_W, 3), dtype=np.uint8)
+                                cv2.putText(bar, lbl[:12], (3, LABEL_H - 4),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 255), 1)
+                                thumbs.append(cv2.vconcat([th, bar]))
+                            return cv2.hconcat(thumbs)
+
+                        # Banker cards → top-LEFT corner
+                        if banker_cards:
+                            strip     = _make_strip(banker_cards, 0)
+                            sh, sw    = strip.shape[:2]
+                            sw        = min(sw, width // 2)
+                            frame[0:sh, 0:sw] = strip[:, :sw]
+                            cv2.putText(frame, "BANKER", (4, sh + 14),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+
+                        # Player cards → top-RIGHT corner
+                        if player_cards:
+                            strip  = _make_strip(player_cards, len(banker_cards))
+                            sh, sw = strip.shape[:2]
+                            sw     = min(sw, width // 2)
+                            frame[0:sh, width - sw:width] = strip[:, :sw]
+                            (tw, _), _ = cv2.getTextSize(
+                                "PLAYER", cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+                            cv2.putText(frame, "PLAYER", (width - tw - 4, sh + 14),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
                          
             # 2.7 display  
-            if viz: 
-                cv2.putText(frame, f"fn={fn}, {fn/fps:.1f}s", (15, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            if viz:
+                # Frame number + timestamp — centered at the top
+                hud = f"fn={fn}  {fn/fps:.1f}s"
+                (tw, _), _ = cv2.getTextSize(hud, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                cv2.putText(frame, hud, ((width - tw) // 2, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
                 cv2.imshow("layout(yello), FG(blue)", frame)
     
             if record_file is not None:

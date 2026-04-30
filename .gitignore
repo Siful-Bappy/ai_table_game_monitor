@@ -229,6 +229,7 @@ dataset_bee_cards/
 working/
 save_cards/
 save_cards/1777283923/
+gkl_mask1_comprressed/
 
 # Generated / augmented dataset output folders
 dataset_gkl_cards/augmented*/

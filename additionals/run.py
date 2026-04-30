@@ -11,6 +11,9 @@ python mobilenet_card_classifier.py train dataset_gkl_cards/augmented
 # Step 3 — evaluate
 python mobilenet_card_classifier.py test  dataset_gkl_cards/augmented/val
 
+
+
+
 # Show on screen only — no file saved  (original behaviour)
 python main.py gkl_table1_layout.jpg gkl_mask1.avi
 
@@ -22,6 +25,25 @@ python main.py gkl_table1_layout.jpg gkl_mask1.avi --save --output my_run.mp4
 
 # Save without showing on screen (headless server / SSH)
 python main.py gkl_table1_layout.jpg gkl_mask1.avi --save --no-viz
+
+python compress_video.py --video gkl_mask1.avi
+
+
+
+python compress_val_dataset.py
+Val only (default CRFs: 0 18 23 28 35 42 47 51):
+
+
+python compress_val_dataset.py
+Val + Train at CRF 28 and 38:
+python compress_val_dataset.py --train
+
+Train only at CRF 28 and 38 (skip val):
+python compress_val_dataset.py --crf none --train
+
+Actually that won't work cleanly — if you want train-only, just run:
+python compress_val_dataset.py --crf 28 38 --train --crf-train 28 38
+
 
 Inside main.py, it runs a pipeline roughly like:
     table alignment / homography-ish

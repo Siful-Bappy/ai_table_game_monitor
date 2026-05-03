@@ -166,7 +166,7 @@ class GameHUD:
             bt     = ev.data.get("banker_total", 0)
             colour = _WINNER_COL.get(winner, WHITE)
             line1  = f"{winner} WINS!" if winner != "TIE" else "TIE!"
-            line2  = f"Player {pt}  vs  Banker {bt}"
+            line2  = f"Banker {bt}  vs  Player {pt}"
             msg    = self._show(line1, line2, colour, 4.0, big=True)
             # keep a permanent copy until reset
             self._game_over_msg = msg

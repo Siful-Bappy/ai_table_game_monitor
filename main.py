@@ -439,7 +439,13 @@ class TableTracker:
                 logger.warning("cannot load model or transformer")
                 return        
      
-        # 2. Run 
+        # 1.5 Baccarat game engine + HUD
+        from baccarat_engine import BaccaratGameEngine
+        from game_hud import GameHUD
+        game_engine = BaccaratGameEngine(fps=fps)
+        hud = GameHUD(width=width, height=height, fps=fps)
+
+        # 2. Run
         fn = 1
         t_sleep = 1 #30
         while True:
@@ -503,8 +509,8 @@ class TableTracker:
             else:
                 
                 cnts = [0,0,0]
-                banker_cards = []   # cards detected in the banker zone
-                player_cards = []   # cards detected in the player zone
+                banker_cards = []   # (cx, img) tuples — sorted left→right later
+                player_cards = []   # (cx, img) tuples — sorted left→right later
                 positions = [[],[],[]]
                 for det in detect_list:
                     x1, y1, x2, y2, conf, cls = det   # TL, BR, conf, cls
@@ -529,9 +535,9 @@ class TableTracker:
                                 if opt_classify_card:
                                     img_card = cv2.resize(frame_o[2*y1:2*y2,2*x1:2*x2,:], (width_card,height_card))
                                     if "bank" in layout_label.lower():
-                                        banker_cards.append(img_card)
+                                        banker_cards.append((cx, img_card))
                                     else:
-                                        player_cards.append(img_card)
+                                        player_cards.append((cx, img_card))
                             else:
                                 pass # ignore it
 
@@ -541,9 +547,9 @@ class TableTracker:
                                 if opt_classify_card:
                                     img_card = cv2.resize(cv2.rotate(frame_o[2*y1:2*y2,2*x1:2*x2,:], cv2.ROTATE_90_CLOCKWISE), (width_card,height_card))
                                     if "bank" in layout_label.lower():
-                                        banker_cards.append(img_card)
+                                        banker_cards.append((cx, img_card))
                                     else:
-                                        player_cards.append(img_card)
+                                        player_cards.append((cx, img_card))
                             else:
                                 pass # ignore it
 
@@ -570,68 +576,94 @@ class TableTracker:
                 #img_annotated = TableLayout.draw_polygons_from_dict(frame, layout) # img_annotated, layout) 
                 #tracker.overlay_layout(img_annotated)
             
-            # 2.5. key game event detections
-            # @TODO
-        
-        
-            # 2.6. detail info: card classification
+            # 2.5. Card classification + game event detection
             if opt_classify_card:
-                all_cards = banker_cards + player_cards
-                if all_cards:
+                # Sort cards left→right by x-centre so slot indices are stable
+                banker_cards.sort(key=lambda t: t[0])
+                player_cards.sort(key=lambda t: t[0])
+                b_imgs = [img for _, img in banker_cards]
+                p_imgs = [img for _, img in player_cards]
+
+                all_imgs = b_imgs + p_imgs
+                banker_labels = []
+                player_labels = []
+
+                if all_imgs:
                     pred_ids, probs = mobilenet_card.classify_cards(
-                        card_classifier, card_preprocessor, all_cards)
+                        card_classifier, card_preprocessor, all_imgs)
 
-                    # Save every card crop to its predicted class folder
+                    banker_labels = [card_label_list[pred_ids[i]]
+                                     for i in range(len(b_imgs))]
+                    player_labels = [card_label_list[pred_ids[i + len(b_imgs)]]
+                                     for i in range(len(p_imgs))]
+
+                    # Save card crops to predicted-class folders
                     if save_card:
-                        for i, img_c in enumerate(all_cards):
+                        for i, img_c in enumerate(all_imgs):
                             lbl = card_label_list[pred_ids[i]]
-                            cv2.imwrite(os.path.join(save_dir, lbl, f"{fn}_{i}.jpg"), img_c)
+                            cv2.imwrite(
+                                os.path.join(save_dir, lbl, f"{fn}_{i}.jpg"),
+                                img_c)
 
-                    if viz:
-                        THUMB_W, THUMB_H = width_card // 2, height_card // 2
+                # ── Baccarat game engine ─────────────────────────────────
+                game_events = game_engine.update(player_labels, banker_labels, fn)
+                for ev in game_events:
+                    logger.info(str(ev))
+                    hud.add_event(ev)
+                hud.update_from_engine(game_engine)
 
-                        LABEL_H = 20   # height of the label bar below each card
+                # ── Card thumbnail strips ────────────────────────────────
+                if viz:
+                    THUMB_W, THUMB_H = width_card // 2, height_card // 2
+                    LABEL_H = 20
 
-                        def _make_strip(cards, id_offset):
-                            """Full card thumbnail + label bar below (no overlap)."""
-                            thumbs = []
-                            for j, img_c in enumerate(cards):
-                                th  = cv2.resize(img_c, (THUMB_W, THUMB_H))
-                                lbl = card_label_list[pred_ids[id_offset + j]]
-                                # Separate black bar below the card image
-                                bar = np.zeros((LABEL_H, THUMB_W, 3), dtype=np.uint8)
-                                cv2.putText(bar, lbl[:12], (3, LABEL_H - 4),
-                                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 255), 1)
-                                thumbs.append(cv2.vconcat([th, bar]))
-                            return cv2.hconcat(thumbs)
+                    def _make_strip(imgs, labels):
+                        thumbs = []
+                        for img_c, lbl in zip(imgs, labels):
+                            th  = cv2.resize(img_c, (THUMB_W, THUMB_H))
+                            bar = np.zeros((LABEL_H, THUMB_W, 3), dtype=np.uint8)
+                            cv2.putText(bar, lbl[:12], (3, LABEL_H - 4),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.35,
+                                        (0, 255, 255), 1)
+                            thumbs.append(cv2.vconcat([th, bar]))
+                        return cv2.hconcat(thumbs) if thumbs else None
 
-                        # Banker cards → top-LEFT corner
-                        if banker_cards:
-                            strip     = _make_strip(banker_cards, 0)
-                            sh, sw    = strip.shape[:2]
-                            sw        = min(sw, width // 2)
+                    # Banker thumbnails → top-LEFT
+                    if b_imgs:
+                        strip = _make_strip(b_imgs, banker_labels)
+                        if strip is not None:
+                            sh, sw = strip.shape[:2]
+                            sw = min(sw, width // 2)
                             frame[0:sh, 0:sw] = strip[:, :sw]
                             cv2.putText(frame, "BANKER", (4, sh + 14),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                                        (0, 255, 255), 1)
 
-                        # Player cards → top-RIGHT corner
-                        if player_cards:
-                            strip  = _make_strip(player_cards, len(banker_cards))
+                    # Player thumbnails → top-RIGHT
+                    if p_imgs:
+                        strip = _make_strip(p_imgs, player_labels)
+                        if strip is not None:
                             sh, sw = strip.shape[:2]
-                            sw     = min(sw, width // 2)
+                            sw = min(sw, width // 2)
                             frame[0:sh, width - sw:width] = strip[:, :sw]
                             (tw, _), _ = cv2.getTextSize(
                                 "PLAYER", cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-                            cv2.putText(frame, "PLAYER", (width - tw - 4, sh + 14),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+                            cv2.putText(frame, "PLAYER",
+                                        (width - tw - 4, sh + 14),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                                        (0, 255, 255), 1)
                          
-            # 2.7 display  
+            # 2.7 display
             if viz:
-                # Frame number + timestamp — centered at the top
-                hud = f"fn={fn}  {fn/fps:.1f}s"
-                (tw, _), _ = cv2.getTextSize(hud, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-                cv2.putText(frame, hud, ((width - tw) // 2, 30),
+                # Frame number + timestamp — centred at the top
+                fn_txt = f"fn={fn}  {fn/fps:.1f}s"
+                (tw, _), _ = cv2.getTextSize(fn_txt, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                cv2.putText(frame, fn_txt, ((width - tw) // 2, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+                # Game HUD (toasts + panel + winner banner) — bottom-right
+                hud.draw(frame, fn)
+
                 cv2.imshow("layout(yello), FG(blue)", frame)
     
             if record_file is not None:

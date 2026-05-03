@@ -11,16 +11,26 @@ Dataset layout (produced by augment_dataset.py):
 Usage
 -----
     # Step 1 – compute & cache dataset mean/std (run once)
-    python mobilenet_card_classifier.py stats  dataset_gkl_cards/augmented
+    python mobilenet_card_classifier.py stats
 
-    # Step 2 – train
-    python mobilenet_card_classifier.py train  dataset_gkl_cards/augmented
+    # Step 2 – train on clean augmented data
+    python mobilenet_card_classifier.py train
+
+    # Train on CRF-compressed training data (CRF 28 or 38)
+    python mobilenet_card_classifier.py train --crf-train 28
+    python mobilenet_card_classifier.py train --crf-train 38
+
+    # Custom train / val directories
+    python mobilenet_card_classifier.py train \\
+        --train-dir dataset_gkl_cards/compressed_train/crf_28 \\
+        --val-dir   dataset_gkl_cards/augmented/val \\
+        --tag       crf28
 
     # Step 3 – evaluate on val folder
-    python mobilenet_card_classifier.py test   dataset_gkl_cards/augmented/val
+    python mobilenet_card_classifier.py test
 
     # Predict a single image
-    python mobilenet_card_classifier.py test   path/to/card.jpg
+    python mobilenet_card_classifier.py test --image path/to/card.jpg
 """
 
 import os
@@ -28,7 +38,6 @@ import json
 import random
 import pickle
 import shutil
-
 import cv2
 import numpy as np
 from glob import glob
@@ -128,6 +137,7 @@ class MobileNet(nn.Module):
             num_classes=NUM_CLASSES,
             global_pool="avg",
             pretrained=True,
+            drop_rate=0.3,   # dropout on classifier head — prevents memorization
         )
 
     def forward(self, x):
@@ -144,9 +154,10 @@ class MyDataset(Dataset):
     Class index is derived from class_list (must match card_labels.json order).
     """
     def __init__(self, img_paths, class_list, tf=None):
-        self.paths      = img_paths
-        self.card_class = class_list
-        self.transform  = tf
+        self.paths     = img_paths
+        self.transform = tf
+        # O(1) lookup instead of list.index() which is O(n) per image
+        self.class_to_idx = {cls: i for i, cls in enumerate(class_list)}
 
     def __len__(self):
         return len(self.paths)
@@ -157,7 +168,7 @@ class MyDataset(Dataset):
         if self.transform:
             img = self.transform(img)
         cls_name = os.path.basename(os.path.dirname(path))
-        label    = self.card_class.index(cls_name)   # sort order must match!
+        label    = self.class_to_idx[cls_name]
         return img, label
 
 
@@ -191,28 +202,28 @@ class TrainHelper:
         self.save_path = save_path
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
 
-    def accuracy(self, outputs, labels):
-        pred = torch.argmax(outputs, dim=1)
-        return torch.tensor(torch.sum(pred == labels).item() / len(pred))
-
     @torch.no_grad()
     def _validate_batch(self, model, batch):
         imgs, labels = batch
         out  = model(imgs)
+        pred = torch.argmax(out, dim=1)
         return {
-            "val_loss": F.cross_entropy(out, labels).detach(),
-            "val_acc":  self.accuracy(out, labels),
+            "val_loss":  F.cross_entropy(out, labels).detach(),
+            "n_correct": int((pred == labels).sum().item()),
+            "n_samples": len(labels),
         }
 
     @torch.no_grad()
     def evaluation(self, model, loader):
         model.eval()
-        results    = [self._validate_batch(model, b) for b in loader]
-        epoch_loss = torch.stack([r["val_loss"] for r in results]).mean()
-        epoch_acc  = torch.stack([r["val_acc"]  for r in results]).mean()
+        results     = [self._validate_batch(model, b) for b in loader]
+        epoch_loss  = torch.stack([r["val_loss"] for r in results]).mean()
+        # exact accuracy: total_correct / total_samples (correct even for unequal batch sizes)
+        n_correct   = sum(r["n_correct"] for r in results)
+        n_samples   = sum(r["n_samples"] for r in results)
         return {
             "val_loss": round(epoch_loss.item(), 5),
-            "val_acc":  round(epoch_acc.item(),  5),
+            "val_acc":  round(n_correct / n_samples, 5),
         }
 
     def logging(self, epoch, result):
@@ -227,20 +238,29 @@ class TrainHelper:
 # Train  (Step 2)
 # -----------------------------------------------------------------------
 
-def train(dataset_dir, checkpoint_path=None, epochs=100, batch_size=32, lr=1e-3):
+def train(train_dir, val_dir, checkpoint_path=None, epochs=50, batch_size=32,
+          lr=3e-4, working_dir=None):
     """
-    Train MobileNet on the augmented GKL card dataset.
+    Train MobileNet on the GKL card dataset.
 
     Parameters
     ----------
-    dataset_dir     : folder containing train/ and val/ sub-folders
-    checkpoint_path : optional .pt file to resume training from
+    train_dir       : folder containing <class_name>/<img>.jpg for training
+    val_dir         : folder containing <class_name>/<img>.jpg for validation
+    checkpoint_path : optional .pt file to resume from
     epochs          : training epochs
     batch_size      : mini-batch size
     lr              : initial learning rate (Adam + CosineAnnealing)
+    working_dir     : output folder for checkpoints and history
     """
+    working_dir = working_dir or WORKING_DIR
+    os.makedirs(working_dir, exist_ok=True)
+
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device : {DEVICE}\n")
+    print(f"Device      : {DEVICE}")
+    print(f"Train dir   : {train_dir}")
+    print(f"Val dir     : {val_dir}")
+    print(f"Working dir : {working_dir}\n")
 
     # ── Labels ──────────────────────────────────────────────────────────
     with open("card_labels.json", "r", encoding="utf-8") as f:
@@ -259,13 +279,16 @@ def train(dataset_dir, checkpoint_path=None, epochs=100, batch_size=32, lr=1e-3)
         print("Starting fresh (pretrained ImageNet backbone).")
     model.to(DEVICE)
 
+    # ── Regularisation summary ───────────────────────────────────────────
+    print(f"Regularisation  : dropout=0.3  weight_decay=1e-4  label_smoothing=0.1")
+    print(f"LR              : {lr}  (OneCycleLR — 30% warmup → cosine anneal, {epochs} epochs)\n")
+
     # ── Transforms ──────────────────────────────────────────────────────
-    # Images are already 224×224 from augment_dataset.py.
-    # Resize to 256 first so RandomCrop gives spatial diversity.
+    # RandomHorizontalFlip is intentionally DISABLED — flipping confuses
+    # cards whose values differ by rotation (6↔9) or suit layout.
     train_tf = transforms.Compose([
         transforms.Resize((256, 256)),
         transforms.RandomCrop(224),
-        transforms.RandomHorizontalFlip(),
         transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1),
         transforms.ToTensor(),
         transforms.Normalize(mean, std),
@@ -277,19 +300,19 @@ def train(dataset_dir, checkpoint_path=None, epochs=100, batch_size=32, lr=1e-3)
     ])
 
     # ── Image paths ─────────────────────────────────────────────────────
-    train_paths = glob(os.path.join(dataset_dir, "train/*/*.jpg"))
-    val_paths   = glob(os.path.join(dataset_dir, "val/*/*.jpg"))
+    train_paths = glob(os.path.join(train_dir, "*/*.jpg"))
+    val_paths   = glob(os.path.join(val_dir,   "*/*.jpg"))
 
     if not train_paths:
-        raise ValueError(f"No images found in {dataset_dir}/train/")
+        raise ValueError(f"No images found in {train_dir}")
     if not val_paths:
-        raise ValueError(f"No images found in {dataset_dir}/val/")
+        raise ValueError(f"No images found in {val_dir}")
 
     print(f"Train images : {len(train_paths)}")
     print(f"Val   images : {len(val_paths)}\n")
 
     # ── DataLoaders ─────────────────────────────────────────────────────
-    num_workers = 4 if os.name != "nt" else 0   # 0 on Windows
+    num_workers = 4 if os.name != "nt" else 0
     train_dl = DeviceDL(DataLoader(
         MyDataset(train_paths, card_label_list, tf=train_tf),
         batch_size=batch_size, shuffle=True,
@@ -302,11 +325,20 @@ def train(dataset_dir, checkpoint_path=None, epochs=100, batch_size=32, lr=1e-3)
     ))
 
     # ── Optimiser + scheduler ───────────────────────────────────────────
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    # AdamW: decoupled weight decay — more principled than Adam for fine-tuning
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
 
-    os.makedirs(WORKING_DIR, exist_ok=True)
-    helper       = TrainHelper()
+    # OneCycleLR: per-batch schedule — smooth 30% warmup then cosine anneal.
+    # Stepped every batch (not epoch) → no epoch-boundary LR jumps → stable val curves.
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer, max_lr=lr,
+        steps_per_epoch=len(train_dl), epochs=epochs,
+        pct_start=0.3, anneal_strategy='cos',
+        div_factor=10.0, final_div_factor=1e4,
+    )
+
+    history_path = os.path.join(working_dir, "history.pickle")
+    helper       = TrainHelper(save_path=history_path)
     best_acc     = 0.0
     best_ckpt    = ""
 
@@ -317,26 +349,25 @@ def train(dataset_dir, checkpoint_path=None, epochs=100, batch_size=32, lr=1e-3)
 
         for imgs, labels in tqdm(train_dl, desc=f"Epoch {epoch}/{epochs}", leave=False):
             optimizer.zero_grad()
-            loss = F.cross_entropy(model(imgs), labels)
+            loss = F.cross_entropy(model(imgs), labels, label_smoothing=0.1)
             loss.backward()
             optimizer.step()
+            scheduler.step()   # OneCycleLR must step every batch
             train_losses.append(loss.detach())
-
-        scheduler.step()
 
         result = helper.evaluation(model, val_dl)
         result["train_loss"] = torch.stack(train_losses).mean().item()
 
         if result["val_acc"] > best_acc:
             best_acc  = result["val_acc"]
-            best_ckpt = os.path.join(WORKING_DIR, f"best_ep{epoch}_{best_acc:.4f}.pt")
+            best_ckpt = os.path.join(working_dir, f"best_ep{epoch}_{best_acc:.4f}.pt")
             torch.save(model.state_dict(), best_ckpt)
             print(f"  ✓ New best → {best_ckpt}")
 
         helper.logging(epoch, result)
 
     # Copy best weights as canonical best.pt
-    final_path = os.path.join(WORKING_DIR, "best.pt")
+    final_path = os.path.join(working_dir, "best.pt")
     if best_ckpt:
         shutil.copy(best_ckpt, final_path)
         print(f"\nBest model saved → {final_path}  (val_acc={best_acc:.4f})")
@@ -445,40 +476,93 @@ def test_all(model, dataset_dir, card_label_list):
 # CLI entry point
 # -----------------------------------------------------------------------
 
+DEFAULT_TRAIN_DIR = "dataset_gkl_cards/augmented/train"
+DEFAULT_VAL_DIR   = "dataset_gkl_cards/augmented/val"
+DEFAULT_STATS_DIR = "dataset_gkl_cards/augmented"
+COMPRESSED_TRAIN  = "dataset_gkl_cards/compressed_train"
+
 if __name__ == "__main__":
-    import sys
+    import argparse
 
-    def _usage():
-        print("Usage:")
-        print("  python mobilenet_card_classifier.py stats  <dataset_dir>")
-        print("  python mobilenet_card_classifier.py train  <dataset_dir>")
-        print("  python mobilenet_card_classifier.py test   <dataset_dir/val  |  image.jpg>")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(
+        description="MobileNet card classifier — train / test / stats")
+    parser.add_argument("cmd", choices=["stats", "train", "test"],
+                        help="Command to run")
 
-    if len(sys.argv) < 3:
-        _usage()
+    # --- train args ---
+    parser.add_argument("--train-dir", default=None,
+                        help="Training images folder  (<class>/<img>.jpg). "
+                             "Defaults to augmented/train or compressed_train/crf_XX if --crf-train is set.")
+    parser.add_argument("--val-dir",   default=DEFAULT_VAL_DIR,
+                        help=f"Validation folder  (default: {DEFAULT_VAL_DIR})")
+    parser.add_argument("--crf-train", type=int, default=None,
+                        help="Use CRF-compressed training data at this level "
+                             f"(e.g. 28 or 38 → {COMPRESSED_TRAIN}/crf_XX)")
+    parser.add_argument("--tag",       default=None,
+                        help="Suffix for the working directory  (e.g. 'crf28'). "
+                             "Auto-set when --crf-train is used.")
+    parser.add_argument("--checkpoint", default=None,
+                        help="Path to .pt checkpoint to resume from")
+    parser.add_argument("--epochs",    type=int, default=20)
+    parser.add_argument("--batch-size",type=int, default=64)
+    parser.add_argument("--lr",        type=float, default=3e-4)
 
-    cmd = sys.argv[1]
+    # --- stats args ---
+    parser.add_argument("--stats-dir", default=DEFAULT_STATS_DIR,
+                        help=f"Dataset root for stats computation  (default: {DEFAULT_STATS_DIR})")
 
-    if cmd == "stats":
-        compute_dataset_stats(sys.argv[2])
+    # --- test args ---
+    parser.add_argument("--test-dir",  default=DEFAULT_VAL_DIR,
+                        help=f"Val/test folder or single image  (default: {DEFAULT_VAL_DIR})")
+    parser.add_argument("--image",     default=None,
+                        help="Single image path for prediction")
 
-    elif cmd == "train":
-        dataset_dir     = sys.argv[2]
-        checkpoint_path = os.path.join(WORKING_DIR, "best.pt")
+    args = parser.parse_args()
+
+    # ── stats ────────────────────────────────────────────────────────────
+    if args.cmd == "stats":
+        compute_dataset_stats(args.stats_dir)
+
+    # ── train ────────────────────────────────────────────────────────────
+    elif args.cmd == "train":
+        # Resolve train dir
+        if args.train_dir:
+            train_dir = args.train_dir
+            tag       = args.tag or os.path.basename(train_dir)
+        elif args.crf_train is not None:
+            train_dir = os.path.join(COMPRESSED_TRAIN, f"crf_{args.crf_train}")
+            tag       = args.tag or f"crf{args.crf_train}"
+        else:
+            train_dir = DEFAULT_TRAIN_DIR
+            tag       = args.tag or "clean"
+
+        working_dir = os.path.join(WORKING_DIR, tag) if tag != "clean" else WORKING_DIR
+
         # Auto-compute stats if not cached yet
         if not os.path.exists(STATS_PATH):
             print("Stats not found — computing now ...\n")
-            compute_dataset_stats(dataset_dir)
-        train(dataset_dir, checkpoint_path=checkpoint_path)
+            compute_dataset_stats(args.stats_dir)
 
-    elif cmd == "test":
+        checkpoint_path = args.checkpoint or os.path.join(working_dir, "best.pt")
+
+        train(
+            train_dir       = train_dir,
+            val_dir         = args.val_dir,
+            checkpoint_path = checkpoint_path,
+            epochs          = args.epochs,
+            batch_size      = args.batch_size,
+            lr              = args.lr,
+            working_dir     = working_dir,
+        )
+
+    # ── test ─────────────────────────────────────────────────────────────
+    elif args.cmd == "test":
         with open("card_labels.json", "r", encoding="utf-8") as f:
             card_label_list = json.load(f)
-        checkpoint_path = os.path.join(WORKING_DIR, "best.pt")
+        checkpoint_path = args.checkpoint or os.path.join(WORKING_DIR, "best.pt")
         model = load_model(checkpoint_path)
 
-        target = sys.argv[2]
+        target = args.image or args.test_dir
         if os.path.isdir(target):
             test_all(model, target, card_label_list)
         else:
@@ -488,6 +572,3 @@ if __name__ == "__main__":
             img = cv2.imread(target)
             cv2.imshow("card", img)
             cv2.waitKey(0)
-
-    else:
-        _usage()

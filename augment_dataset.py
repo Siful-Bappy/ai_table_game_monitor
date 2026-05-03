@@ -39,6 +39,7 @@ Usage
 """
 
 import os
+import re
 import random
 from pathlib import Path
 from typing import Callable, List
@@ -98,13 +99,13 @@ class DatasetAugmentor:
         """
         return [
             self._random_rotation,
-            # self._random_flip,
-            # self._random_brightness_contrast,
-            # self._random_hsv,
-            # self._random_gaussian_blur,
-            # self._random_gaussian_noise,
-            # self._random_perspective,
-            # self._random_crop_and_resize,
+            # self._random_flip — DISABLED: flipping confuses 6↔9, J↔L, etc.
+            self._random_brightness_contrast,
+            self._random_hsv,
+            self._random_gaussian_blur,
+            self._random_gaussian_noise,
+            self._random_perspective,
+            self._random_crop_and_resize,
         ]
 
     def preprocess_image(self, image: np.ndarray) -> np.ndarray:
@@ -137,7 +138,12 @@ class DatasetAugmentor:
     # ------------------------------------------------------------------
 
     def generate(self):
-        """Process all class folders and write train/val splits."""
+        """Process all class folders and write train/val splits.
+
+        Uses a run-level 75/25 split: the last 25% of runs go entirely to val,
+        the rest to train.  Runs are never split internally, so train and val
+        see completely different card positions (no consecutive-frame leakage).
+        """
         class_dirs = sorted(d for d in self.source_dir.iterdir() if d.is_dir())
 
         if not class_dirs:
@@ -160,20 +166,32 @@ class DatasetAugmentor:
                 print(f"  [{idx:>3}/{len(class_dirs)}]  SKIP (no images): {class_name}")
                 continue
 
-            random.shuffle(images)
+            # Run-level split: assign entire runs to train or val.
+            # Each run = consecutive frames of the same card in one position.
+            # Splitting within a run leaks near-identical frames into val,
+            # making accuracy trivially high. Keeping whole runs separate
+            # ensures train and val see completely different card positions.
+            runs = self._split_into_runs(images)
+            n_val_runs  = max(1, round(len(runs) * 0.25))
+            val_runs    = runs[-n_val_runs:]
+            train_runs  = runs[:-n_val_runs] if len(runs) > n_val_runs else runs
 
-            # Reserve images for validation (no augmentation on val set)
-            n_val_src  = min(self.val_target, len(images))
-            val_src    = images[:n_val_src]
-            # Remaining goes to training; if not enough, reuse all
-            train_src  = images[n_val_src:] or images
+            train_src = [p for run in train_runs for p in run]
+            val_src   = [p for run in val_runs   for p in run]
 
-            self._fill_split(val_src,   val_out,   self.val_target,   augment=False, prefix='val')
+            if not train_src:   # only 1 run total — use it for both
+                train_src = val_src
+
+            # Never cycle val images — every val image is unique
+            val_actual = min(len(val_src), self.val_target)
+            self._fill_split(val_src,   val_out,   val_actual,        augment=False, prefix='val')
             self._fill_split(train_src, train_out, self.train_target, augment=True,  prefix='aug')
 
             print(
                 f"  [{idx:>3}/{len(class_dirs)}]  {class_name:<14} "
-                f"src={len(images):>5}  →  train={self.train_target}  val={self.val_target}"
+                f"src={len(images):>5}  runs={len(runs):>3}  "
+                f"train_runs={len(train_runs):>2}  val_runs={len(val_runs):>2}  "
+                f"val_imgs={val_actual}"
             )
 
         print("\nDone.")
@@ -208,6 +226,42 @@ class DatasetAugmentor:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _get_frame_number(path: Path) -> int:
+        """Extract frame number from filenames like '018402_card03_c0.76.jpg'.
+        Returns -1 if the name does not start with a numeric prefix."""
+        m = re.match(r'^(\d+)_', path.name)
+        return int(m.group(1)) if m else -1
+
+    def _split_into_runs(self, images: List[Path]) -> List[List[Path]]:
+        """
+        Sort images by frame number and group them into consecutive-frame runs.
+        A new run starts whenever the frame number is not exactly prev+1.
+
+        Each run represents the card lying in one position on the table across
+        multiple frames — all those frames look nearly identical.  Splitting by
+        run (rather than random shuffle) ensures train and val see completely
+        different card appearances.
+        """
+        tagged = sorted(
+            [(self._get_frame_number(p), p) for p in images],
+            key=lambda x: x[0],
+        )
+
+        runs: List[List[Path]] = []
+        current: List[Path] = [tagged[0][1]]
+
+        for i in range(1, len(tagged)):
+            fn_prev, fn_curr = tagged[i - 1][0], tagged[i][0]
+            # consecutive if frame numbers are adjacent AND both are valid
+            if fn_prev != -1 and fn_curr != -1 and fn_curr == fn_prev + 1:
+                current.append(tagged[i][1])
+            else:
+                runs.append(current)
+                current = [tagged[i][1]]
+        runs.append(current)
+        return runs
 
     def _fill_split(
         self,
@@ -249,7 +303,7 @@ class DatasetAugmentor:
 
     def _random_rotation(self, image: np.ndarray) -> np.ndarray:
         h, w = image.shape[:2]
-        angle = random.uniform(-2.0, 2.0)
+        angle = random.uniform(-10.0, 10.0)
         M = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1.0)
         return cv2.warpAffine(image, M, (w, h), borderMode=cv2.BORDER_REFLECT_101)
 

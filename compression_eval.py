@@ -35,9 +35,6 @@ import os
 import json
 import csv
 from glob import glob
-from pathlib import Path
-
-import torch
 from torch.utils.data import DataLoader
 from torchvision import transforms
 
@@ -45,7 +42,8 @@ import mobilenet_card_classifier as mobilenet_card
 from mobilenet_card_classifier import MyDataset, DeviceDL, TrainHelper
 
 
-DEFAULT_CRF_LEVELS = [18, 23, 28, 35, 42, 47, 51]
+# DEFAULT_CRF_LEVELS = [ 42, 47, 51]
+DEFAULT_CRF_LEVELS = [0, 18, 23, 28, 35, 42, 47, 51]
 
 
 # -----------------------------------------------------------------------
@@ -194,6 +192,8 @@ def run_compression_eval(
 
 def _plot_accuracy_curve(results: list, output_dir: str):
     try:
+        import matplotlib
+        matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         import matplotlib.ticker as ticker
     except ImportError:
@@ -208,7 +208,7 @@ def _plot_accuracy_curve(results: list, output_dir: str):
     crfs = [r["crf"] for r in crf_rs]
     accs = [r["val_acc"] * 100 for r in crf_rs]
 
-    fig, ax1 = plt.subplots(figsize=(9, 5))
+    _, ax1 = plt.subplots(figsize=(9, 5))
 
     # Accuracy line
     color_acc = "steelblue"
